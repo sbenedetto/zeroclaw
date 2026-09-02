@@ -658,6 +658,15 @@ pub struct ModelProviderRuntimeOptions {
     /// How compatible chat-completions providers handle image markers in
     /// native role=`tool` results.
     pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
+    /// Root `[multimodal]` policy applied when a provider expands
+    /// `[IMAGE:...]` markers into inline data URIs.
+    ///
+    /// Provider adapters run their own `prepare_messages_for_provider` pass, so
+    /// without this they silently fall back to `MultimodalConfig::default()` and
+    /// an operator's `max_images` / `max_image_size_mb` / `max_image_turns`
+    /// never reach the request that actually carries the images. Root-scoped,
+    /// not per-entry: every alias resolves the same section.
+    pub multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -684,6 +693,7 @@ impl Default for ModelProviderRuntimeOptions {
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
             tool_result_image_policy: Default::default(),
+            multimodal: Default::default(),
         }
     }
 }
@@ -750,6 +760,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         tool_result_image_policy: entry
             .map(|e| e.tool_result_image_policy)
             .unwrap_or_default(),
+        multimodal: config.multimodal.clone(),
     }
 }
 
@@ -817,6 +828,10 @@ pub fn options_for_provider_ref(
             // fallback family must use its own default rather than inherit
             // the previous provider alias's policy.
             options.tool_result_image_policy = Default::default();
+            // `multimodal` is deliberately NOT reset: it is the root
+            // `[multimodal]` section, identical for every alias, so a bare
+            // family ref inherits the same operator policy rather than
+            // silently reverting to library defaults.
             options
         }
     }
@@ -2734,6 +2749,40 @@ mod tests {
             Some(&entry),
         );
         assert_eq!(opts.tool_result_image_policy, ToolResultImagePolicy::Omit);
+    }
+
+    #[test]
+    fn root_multimodal_section_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+        config.multimodal.max_image_size_mb = 2;
+        config.multimodal.max_image_turns = 3;
+
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &config,
+            Some(&ModelProviderConfig::default()),
+        );
+
+        // Operator limits must reach the adapter that expands `[IMAGE:...]`
+        // markers; library defaults here mean the section is inert.
+        assert_eq!(opts.multimodal.max_images, 1);
+        assert_eq!(opts.multimodal.max_image_size_mb, 2);
+        assert_eq!(opts.multimodal.max_image_turns, 3);
+    }
+
+    #[test]
+    fn bare_family_provider_ref_inherits_root_multimodal_policy() {
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+
+        let fallback = model_provider_runtime_options_from_model_provider_entry(&config, None);
+        let options = options_for_provider_ref(&config, "ollama", &fallback);
+
+        // `[multimodal]` is root-scoped, so unlike the provider-specific
+        // `tool_result_image_policy` it must survive a bare family ref.
+        assert_eq!(options.multimodal.max_images, 1);
     }
 
     #[test]
