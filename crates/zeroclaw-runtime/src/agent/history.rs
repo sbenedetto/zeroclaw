@@ -169,7 +169,7 @@ const MAX_PROMOTED_TOOL_RESULT_IMAGES: usize = 8;
 /// provider call. This targets shell/skill outputs that print filesystem
 /// paths directly rather than returning explicit media markers.
 ///
-/// A result carrying more than [`MAX_PROMOTED_TOOL_RESULT_IMAGES`] promotable
+/// A result carrying more than `MAX_PROMOTED_TOOL_RESULT_IMAGES` promotable
 /// paths is treated as a path listing: nothing is promoted and every path
 /// survives as ordinary text, so the model still sees the listing. Explicit
 /// `[IMAGE:...]` markers already present in the output are never affected —
