@@ -837,6 +837,28 @@ pub fn options_for_provider_ref(
     }
 }
 
+/// Runtime options for a **bare family** reference (`ollama`) or an inline
+/// `custom:<url>` reference, neither of which resolves a configured entry.
+///
+/// Everything provider-specific (kind, URI, credentials, `vision`, ...) stays at
+/// its default because there is no entry to read it from. The root
+/// `[multimodal]` policy is not provider-specific, so it must still reach the
+/// adapter: `ModelProviderRuntimeOptions::default()` embeds
+/// `MultimodalConfig::default()`, and an adapter built that way re-applies
+/// library image limits to messages the runtime already prepared under the
+/// operator's policy — silently dropping attachments the operator allowed.
+///
+/// This path is reached in production by `resolve_vision_provider` for a
+/// configured `multimodal.vision_model_provider`.
+fn bare_family_runtime_options(
+    config: &zeroclaw_config::schema::Config,
+) -> ModelProviderRuntimeOptions {
+    ModelProviderRuntimeOptions {
+        multimodal: config.multimodal.clone(),
+        ..ModelProviderRuntimeOptions::default()
+    }
+}
+
 fn is_secret_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
 }
@@ -1782,7 +1804,7 @@ pub fn create_model_provider_from_ref_with_model(
         "default",
         None,
         None,
-        &ModelProviderRuntimeOptions::default(),
+        &bare_family_runtime_options(config),
     )?;
     Ok(ResolvedModelProviderRef {
         provider,
@@ -3484,6 +3506,106 @@ mod tests {
                 panic!("Expected error when custom model model_provider has no URI configured")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bare_family_ref_carries_multimodal_policy_into_prepared_images() {
+        // `resolve_vision_provider` builds the configured vision provider through
+        // this factory, and a bare/`custom:<url>` ref resolves no entry. Building
+        // it with default runtime options made the adapter re-apply library image
+        // limits to messages the runtime had already prepared under the
+        // operator's policy, dropping allowed attachments. Drive a real request
+        // and count the images that actually leave.
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_api::model_provider::ChatRequest;
+        use zeroclaw_config::schema::Config;
+
+        type Capture = Arc<Mutex<Option<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            *capture.lock().expect("capture lock poisoned") = Some(body.to_string());
+            (
+                StatusCode::OK,
+                Json(json!({"choices": [{"message": {"content": "ok"}}]})),
+            )
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut markers = Vec::new();
+        for index in 0..2 {
+            let path = temp.path().join(format!("bare-{index}.png"));
+            std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+            markers.push(format!("[IMAGE:{}]", path.display()));
+        }
+        // One image per message: `trim_old_images` evicts whole messages, so
+        // co-locating both would measure that eviction granularity instead of
+        // whether the operator policy reached this adapter at all.
+        let prompts: Vec<String> = markers
+            .iter()
+            .map(|marker| format!("look {marker}"))
+            .collect();
+
+        // Same server, same ref, same messages; only the operator policy differs.
+        let outbound_images = |max_images: usize, prompts: Vec<String>| async move {
+            let capture: Capture = Arc::new(Mutex::new(None));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let addr = listener.local_addr().expect("test server addr");
+            let app = Router::new()
+                .route("/chat/completions", post(capture_chat_request))
+                .with_state(capture.clone());
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve test server");
+            });
+
+            let mut config = Config::default();
+            config.multimodal.max_images = max_images;
+
+            let resolved = create_model_provider_from_ref_with_model(
+                &config,
+                &format!("custom:http://{addr}"),
+            )
+            .expect("bare custom:<url> ref builds a provider");
+
+            let messages: Vec<ChatMessage> = prompts.into_iter().map(ChatMessage::user).collect();
+            let _ = resolved
+                .provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                )
+                .await;
+
+            let body = capture
+                .lock()
+                .expect("capture lock poisoned")
+                .clone()
+                .expect("provider must have sent a request");
+            server.abort();
+            body.matches("data:image/png;base64,").count()
+        };
+
+        assert_eq!(
+            outbound_images(2, prompts.clone()).await,
+            2,
+            "a policy admitting both images must send both"
+        );
+        assert_eq!(
+            outbound_images(1, prompts).await,
+            1,
+            "an operator cap of one must reach the adapter built from a bare ref"
+        );
     }
 
     #[test]
