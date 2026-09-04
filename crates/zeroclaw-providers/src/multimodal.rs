@@ -962,26 +962,57 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
                 return replay_message_without_stale_tool_images(i, m, &latest_tool_indices);
             };
 
-            let (cleaned, refs) = parse_image_markers(&m.content);
-            // Newest images within the message survive, matching the
-            // oldest-first eviction order across messages.
-            let retained = refs.get(drop_here..).unwrap_or(&[]);
-            let content = if retained.is_empty() {
-                if cleaned.trim().is_empty() {
-                    "[image removed from history]".to_string()
-                } else {
-                    cleaned
-                }
-            } else {
-                compose_multimodal_message(&cleaned, retained)
-            };
-
-            ChatMessage {
-                role: m.role.clone(),
-                content,
-            }
+            trim_message_images(m, drop_here)
         })
         .collect()
+}
+
+/// Drop the `drop_here` oldest image markers from `text`, keeping the newest.
+fn trim_image_markers(text: &str, drop_here: usize) -> String {
+    let (cleaned, refs) = parse_image_markers(text);
+    // Newest images within the message survive, matching the oldest-first
+    // eviction order across messages.
+    let retained = refs.get(drop_here..).unwrap_or(&[]);
+    if retained.is_empty() {
+        if cleaned.trim().is_empty() {
+            "[image removed from history]".to_string()
+        } else {
+            cleaned
+        }
+    } else {
+        compose_multimodal_message(&cleaned, retained)
+    }
+}
+
+/// Apply [`trim_image_markers`] to a message, keeping a native tool-result JSON
+/// envelope intact.
+///
+/// A `role = "tool"` message may carry a serialized `{"tool_call_id": ..,
+/// "content": ..}` object. Trimming the serialized form would strip markers out
+/// of the JSON *and* append the retained ones after the closing brace, leaving
+/// text that no longer parses — the provider serializers then lose
+/// `tool_call_id` and cannot emit a native tool result. Unwrap first, trim the
+/// inner `content`, and re-serialize with the rest of the envelope untouched,
+/// mirroring [`strip_tool_result_image_markers`] and
+/// [`normalize_native_tool_result_json`].
+fn trim_message_images(message: &ChatMessage, drop_here: usize) -> ChatMessage {
+    if message.role == "tool"
+        && let Ok(serde_json::Value::Object(mut obj)) =
+            serde_json::from_str::<serde_json::Value>(&message.content)
+        && let Some(serde_json::Value::String(inner)) = obj.get("content").cloned()
+    {
+        let trimmed = trim_image_markers(&inner, drop_here);
+        obj.insert("content".to_string(), serde_json::Value::String(trimmed));
+        return ChatMessage {
+            role: message.role.clone(),
+            content: serde_json::Value::Object(obj).to_string(),
+        };
+    }
+
+    ChatMessage {
+        role: message.role.clone(),
+        content: trim_image_markers(&message.content, drop_here),
+    }
 }
 
 fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
@@ -1967,6 +1998,75 @@ mod tests {
         assert!(cleaned.contains("Generated image"));
         assert_eq!(refs.len(), 1);
         assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_native_tool_result_json_valid_when_over_the_image_cap() {
+        // Regression: partial trimming used to parse markers out of the whole
+        // serialized envelope and append the retained ones after the closing
+        // brace, so the tool result stopped being JSON and the provider
+        // serializers lost `tool_call_id`. Five images against the default cap
+        // of four is enough to force a partial trim.
+        let temp = tempfile::tempdir().unwrap();
+        let mut markers = Vec::new();
+        for index in 0..5 {
+            let image_path = temp.path().join(format!("shot-{index}.png"));
+            std::fs::write(
+                &image_path,
+                [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            )
+            .unwrap();
+            markers.push(format!("[IMAGE:{}]", image_path.display()));
+        }
+
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "tc-overflow",
+            "tool_name": "screenshot",
+            "content": format!("captured five {}", markers.join(" ")),
+        })
+        .to_string();
+
+        let config = MultimodalConfig::default();
+        let prepared =
+            prepare_messages_for_provider(&[ChatMessage::tool(native_tool_content)], &config)
+                .await
+                .expect("preparation should succeed for an over-cap native tool result");
+
+        assert_eq!(prepared.messages[0].role, "tool");
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("an over-cap tool result must still be valid JSON");
+
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc-overflow"),
+            "tool_call_id must survive trimming so the provider can emit a native tool result"
+        );
+        assert_eq!(
+            value.get("tool_name").and_then(|v| v.as_str()),
+            Some("screenshot"),
+            "other envelope metadata must survive trimming"
+        );
+
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content must remain a JSON string");
+        assert!(
+            inner.contains("captured five"),
+            "surrounding text must survive trimming"
+        );
+
+        let (_, refs) = parse_image_markers(inner);
+        assert_eq!(
+            refs.len(),
+            config.max_images,
+            "exactly the budgeted images are retained, and they live inside `content`"
+        );
+        assert!(
+            refs.iter()
+                .all(|reference| reference.starts_with("data:image/png;base64,")),
+            "retained images stay normalized data URIs"
+        );
     }
 
     #[tokio::test]
