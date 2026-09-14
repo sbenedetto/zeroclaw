@@ -1695,6 +1695,11 @@ impl SlackChannel {
     /// Returns `None` when the message is one of our own posts (either the bot
     /// user or this app's `bot_id`), which is what stops the agent replying to
     /// itself once its own `chat.postMessage` echoes back as a bot post.
+    ///
+    /// A userless `bot_message` can only be told apart from our own echo by
+    /// comparing `bot_id` against this app's `bot_id`. Until that identity is
+    /// known (`auth.test` failed or omitted it), such posts are rejected: the
+    /// admission fails closed rather than risk re-entering on our own output.
     fn inbound_sender_identity<'a>(
         message: &'a serde_json::Value,
         bot_user_id: &str,
@@ -1731,7 +1736,10 @@ impl SlackChannel {
             .map(str::trim)
             .filter(|value| !value.is_empty())?;
         // Our own `bot_id` echo: never re-enter the agent on its own output.
-        if own_bot_id.is_some_and(|own| own == bot_id) {
+        // Without a known own identity there is no safe way to tell the echo
+        // from a foreign app, so nothing userless is admitted.
+        let own = own_bot_id?;
+        if own == bot_id {
             return None;
         }
         Some(InboundSender {
@@ -5775,6 +5783,18 @@ impl Channel for SlackChannel {
         // resolves without an additional `auth.test` round-trip.
         self.cache_bot_user_id().await;
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
+        if self.allow_bot_messages && self.own_bot_id().is_none() {
+            // `inbound_sender_identity` fails closed for userless bot posts
+            // until our own `bot_id` is known, so the opt-in is inert for
+            // those posts on this run. Say so instead of silently dropping.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "allow_bot_messages is enabled but auth.test did not return this app's bot_id; \
+                 app posts without a user field are ignored until the identity is known"
+            );
+        }
         let scoped_channels = self.scoped_channel_ids();
         if self.configured_app_token().is_some() {
             ::zeroclaw_log::record!(
@@ -7080,15 +7100,30 @@ mod tests {
     }
 
     #[test]
-    fn inbound_identity_keeps_foreign_bots_when_own_bot_id_is_unknown() {
-        // `auth.test` may not have been called yet. A foreign bot still
-        // resolves; our own echo is additionally guarded by the bot-user check
-        // and by the allowlist.
+    fn inbound_identity_rejects_userless_bot_posts_until_own_bot_id_is_known() {
+        // When `auth.test` failed or omitted `bot_id`, a userless post cannot
+        // be distinguished from our own echo, so admission fails closed for
+        // every such post, foreign or not. Once the identity is known the
+        // foreign bot resolves and our own echo is still dropped.
         let workflow = serde_json::json!({"bot_id": "B_WORKFLOW", "text": "x"});
+        let own_echo = serde_json::json!({"bot_id": "B_SELF", "text": "x"});
         assert_eq!(
-            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", None, true)
+            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", None, true),
+            None,
+            "unknown own identity must not admit a userless bot post"
+        );
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&own_echo, "U_SELF", None, true),
+            None
+        );
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", Some("B_SELF"), true)
                 .map(|s| (s.id, s.is_bot)),
             Some(("B_WORKFLOW", true))
+        );
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&own_echo, "U_SELF", Some("B_SELF"), true),
+            None
         );
     }
 
@@ -9465,6 +9500,139 @@ mod tests {
                 .iter()
                 .any(|request| request.url.path() == "/conversations.history"),
             "test must drive the production polling ingress"
+        );
+    }
+
+    /// Drive the production polling ingress against a mocked Slack API and
+    /// collect whatever reaches agent dispatch within a short window after the
+    /// first `conversations.history` poll has been served.
+    async fn poll_bot_posts_through_ingress(
+        auth_test_body: serde_json::Value,
+        history_messages: serde_json::Value,
+    ) -> Vec<ChannelMessage> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth.test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(auth_test_body))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.history"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": history_messages
+            })))
+            .mount(&server)
+            .await;
+
+        // Wildcard peers: the allowlist must not be what saves us here.
+        let channel = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec!["C_ORIGIN".into()],
+            "slack_test_alias",
+            Arc::new(|| vec!["*".into()]),
+        )
+        .with_api_base_url(server.uri())
+        .with_allow_bot_messages(true);
+
+        let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(8);
+        let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+        let polled = tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                let served = server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path() == "/conversations.history");
+                if served {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            polled.is_ok(),
+            "test must drive the production polling ingress"
+        );
+
+        let mut delivered = Vec::new();
+        while let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_millis(300), inbound_rx.recv()).await
+        {
+            delivered.push(message);
+        }
+
+        listener.abort();
+        let _ = listener.await;
+        delivered
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_drops_own_userless_bot_echo_when_auth_test_lacks_bot_id() {
+        // `auth.test` answers without `bot_id`, so the channel does not know
+        // its own app identity. With the opt-in on and wildcard peers, our own
+        // userless `bot_message` echo must still never start a turn.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "bot_message",
+                    "bot_id": "B_SELF",
+                    "text": "4"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        assert!(
+            delivered.is_empty(),
+            "no userless bot post may be admitted while own bot_id is unknown, got {:?}",
+            delivered.iter().map(|m| &m.sender).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_admits_foreign_bot_and_drops_own_echo_when_bot_id_is_known() {
+        // Positive control for the fail-closed rule: once `auth.test` supplies
+        // `bot_id`, the foreign app's post starts a turn and our own echo does not.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "bot_message",
+                    "bot_id": "B_SELF",
+                    "text": "4"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        let senders: Vec<&str> = delivered.iter().map(|m| m.sender.as_str()).collect();
+        assert_eq!(
+            senders,
+            vec!["B_WORKFLOW"],
+            "exactly the foreign bot post should reach dispatch"
         );
     }
 
