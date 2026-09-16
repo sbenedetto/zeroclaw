@@ -9542,35 +9542,36 @@ mod tests {
         let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(8);
         let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
 
-        let polled = tokio::time::timeout(Duration::from_secs(6), async {
-            loop {
-                let served = server
-                    .received_requests()
-                    .await
-                    .unwrap()
-                    .iter()
-                    .any(|request| request.url.path() == "/conversations.history");
-                if served {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-        assert!(
-            polled.is_ok(),
-            "test must drive the production polling ingress"
-        );
-
+        // The polling receiver sleeps before its first fetch, so the window has
+        // to outlast one cycle. Wait on the delivery channel rather than
+        // sampling the mock server: a spin here competes for CPU with the rest
+        // of the suite and perturbs timing-sensitive tests elsewhere.
         let mut delivered = Vec::new();
-        while let Ok(Some(message)) =
-            tokio::time::timeout(Duration::from_millis(300), inbound_rx.recv()).await
+        if let Ok(Some(first)) =
+            tokio::time::timeout(Duration::from_secs(9), inbound_rx.recv()).await
         {
-            delivered.push(message);
+            delivered.push(first);
+            while let Ok(Some(next)) =
+                tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv()).await
+            {
+                delivered.push(next);
+            }
         }
 
         listener.abort();
         let _ = listener.await;
+
+        // Checked once, after the listener stops: an empty `delivered` only
+        // means "nothing was admitted" if the ingress actually ran.
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.url.path() == "/conversations.history"),
+            "test must drive the production polling ingress"
+        );
         delivered
     }
 
