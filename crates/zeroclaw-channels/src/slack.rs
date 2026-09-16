@@ -1396,8 +1396,14 @@ impl SlackChannel {
 
         // `auth.test` returns the app's `bot_id` alongside the bot user id.
         // Cache it so `inbound_sender_identity` can recognise our own posts
-        // when they echo back as `subtype = "bot_message"`.
-        if let Some(bot_id) = resp.get("bot_id").and_then(|v| v.as_str())
+        // when they echo back as `subtype = "bot_message"`. A blank value is
+        // not an identity: caching it would read as "known" everywhere and
+        // match none of our own posts, so leave the cache unset instead.
+        if let Some(bot_id) = resp
+            .get("bot_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             && let Ok(mut guard) = self.cached_bot_id.lock()
         {
             *guard = Some(bot_id.to_string());
@@ -1737,8 +1743,12 @@ impl SlackChannel {
             .filter(|value| !value.is_empty())?;
         // Our own `bot_id` echo: never re-enter the agent on its own output.
         // Without a known own identity there is no safe way to tell the echo
-        // from a foreign app, so nothing userless is admitted.
-        let own = own_bot_id?;
+        // from a foreign app, so nothing userless is admitted. A blank own id
+        // is not an identity either: it would compare unequal to our own real
+        // `bot_id` and admit the echo, so it counts as unknown here too.
+        let own = own_bot_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
         if own == bot_id {
             return None;
         }
@@ -7128,6 +7138,27 @@ mod tests {
     }
 
     #[test]
+    fn inbound_identity_treats_blank_own_bot_id_as_unknown() {
+        // A blank own id is not an identity: compared literally it differs
+        // from our real `bot_id` and would admit our own echo, so it has to
+        // count as unknown and fail closed like an absent one.
+        let own_echo = serde_json::json!({"bot_id": "B_SELF", "text": "4"});
+        let workflow = serde_json::json!({"bot_id": "B_WORKFLOW", "text": "x"});
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                SlackChannel::inbound_sender_identity(&own_echo, "U_SELF", Some(blank), true),
+                None,
+                "blank own bot id {blank:?} must not admit our own echo"
+            );
+            assert_eq!(
+                SlackChannel::inbound_sender_identity(&workflow, "U_SELF", Some(blank), true),
+                None,
+                "blank own bot id {blank:?} must fail closed for foreign bots too"
+            );
+        }
+    }
+
+    #[test]
     fn allow_bot_messages_defaults_off_and_builder_sets_it() {
         let channel = SlackChannel::new(
             unique_test_bot_token(),
@@ -9602,6 +9633,37 @@ mod tests {
         assert!(
             delivered.is_empty(),
             "no userless bot post may be admitted while own bot_id is unknown, got {:?}",
+            delivered.iter().map(|m| &m.sender).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_drops_own_userless_bot_echo_when_auth_test_bot_id_is_blank() {
+        // Separate from the missing-field control: `auth.test` answers, but
+        // with a whitespace-only `bot_id`. That is not a usable identity, so
+        // admission must fail closed exactly as it does for an absent one.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "   " }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "bot_message",
+                    "bot_id": "B_SELF",
+                    "text": "4"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        assert!(
+            delivered.is_empty(),
+            "a blank auth.test bot_id must not admit userless bot posts, got {:?}",
             delivered.iter().map(|m| &m.sender).collect::<Vec<_>>()
         );
     }
