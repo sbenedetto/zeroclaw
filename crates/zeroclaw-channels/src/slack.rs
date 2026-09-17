@@ -1736,6 +1736,15 @@ impl SlackChannel {
             return None;
         }
 
+        // The opt-in admits `bot_message` posts, nothing else. Other userless
+        // events can carry a `bot_id` too (a bot-authored `file_share`, say),
+        // and those already pass the subtype gate on their own merits; letting
+        // `bot_id` stand in for a sender here would silently widen the opt-in
+        // to every userless event and make them model-visible.
+        if !is_bot {
+            return None;
+        }
+
         let bot_id = message
             .get("bot_id")
             .and_then(|v| v.as_str())
@@ -7066,7 +7075,7 @@ mod tests {
 
     #[test]
     fn inbound_identity_uses_bot_id_only_when_bots_are_allowed() {
-        let workflow = serde_json::json!({"bot_id": "B_WORKFLOW", "text": "deploy done"});
+        let workflow = serde_json::json!({"subtype": "bot_message", "bot_id": "B_WORKFLOW", "text": "deploy done"});
 
         // Disabled: a userless bot post has no identity, so it never reaches
         // the allowlist and cannot trigger a turn.
@@ -7084,10 +7093,43 @@ mod tests {
     }
 
     #[test]
+    fn inbound_identity_admits_userless_bot_ids_only_for_bot_message() {
+        // The opt-in is scoped to `bot_message`. Other userless events can
+        // carry a `bot_id` as well, and some already pass the subtype gate on
+        // their own merits, but `bot_id` must not become a sender for them:
+        // that would widen the opt-in past its documented boundary.
+        for subtype in [
+            serde_json::Value::Null,
+            serde_json::json!("file_share"),
+            serde_json::json!("thread_broadcast"),
+            serde_json::json!("channel_join"),
+        ] {
+            let mut event = serde_json::json!({"bot_id": "B_WORKFLOW", "text": "x"});
+            if !subtype.is_null() {
+                event["subtype"] = subtype.clone();
+            }
+            assert_eq!(
+                SlackChannel::inbound_sender_identity(&event, "U_SELF", Some("B_SELF"), true),
+                None,
+                "userless event with subtype {subtype:?} must not resolve a bot sender"
+            );
+        }
+
+        // The documented case still resolves.
+        let post =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_WORKFLOW", "text": "x"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&post, "U_SELF", Some("B_SELF"), true)
+                .map(|s| (s.id, s.is_bot)),
+            Some(("B_WORKFLOW", true))
+        );
+    }
+
+    #[test]
     fn inbound_identity_drops_our_own_bot_echo() {
         // Our own `chat.postMessage` echoes back as a bot post. Without this
         // the agent would answer itself in a loop once bots are allowed.
-        let echo = serde_json::json!({"bot_id": "B_SELF", "text": "my own reply"});
+        let echo = serde_json::json!({"subtype": "bot_message", "bot_id": "B_SELF", "text": "my own reply"});
         assert_eq!(
             SlackChannel::inbound_sender_identity(&echo, "U_SELF", Some("B_SELF"), true),
             None
@@ -7115,8 +7157,10 @@ mod tests {
         // be distinguished from our own echo, so admission fails closed for
         // every such post, foreign or not. Once the identity is known the
         // foreign bot resolves and our own echo is still dropped.
-        let workflow = serde_json::json!({"bot_id": "B_WORKFLOW", "text": "x"});
-        let own_echo = serde_json::json!({"bot_id": "B_SELF", "text": "x"});
+        let workflow =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_WORKFLOW", "text": "x"});
+        let own_echo =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_SELF", "text": "x"});
         assert_eq!(
             SlackChannel::inbound_sender_identity(&workflow, "U_SELF", None, true),
             None,
@@ -7142,8 +7186,10 @@ mod tests {
         // A blank own id is not an identity: compared literally it differs
         // from our real `bot_id` and would admit our own echo, so it has to
         // count as unknown and fail closed like an absent one.
-        let own_echo = serde_json::json!({"bot_id": "B_SELF", "text": "4"});
-        let workflow = serde_json::json!({"bot_id": "B_WORKFLOW", "text": "x"});
+        let own_echo =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_SELF", "text": "4"});
+        let workflow =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_WORKFLOW", "text": "x"});
         for blank in ["", "   ", "\t"] {
             assert_eq!(
                 SlackChannel::inbound_sender_identity(&own_echo, "U_SELF", Some(blank), true),
@@ -9634,6 +9680,43 @@ mod tests {
             delivered.is_empty(),
             "no userless bot post may be admitted while own bot_id is unknown, got {:?}",
             delivered.iter().map(|m| &m.sender).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_keeps_the_opt_in_scoped_to_bot_message() {
+        // Opted in, identity known, wildcard peers: a userless `file_share`
+        // carrying a foreign `bot_id` passes the base subtype gate but is not
+        // what the operator opted into, so it must not start a turn. The
+        // `bot_message` in the same batch still does.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "file_share",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> here is a file"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        let texts: Vec<&str> = delivered.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            texts.len(),
+            1,
+            "only the bot_message should be admitted, got {texts:?}"
+        );
+        assert!(
+            texts[0].contains("what is 2+2?"),
+            "the admitted message should be the bot_message, got {texts:?}"
         );
     }
 
