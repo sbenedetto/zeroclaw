@@ -1706,6 +1706,9 @@ impl SlackChannel {
     /// comparing `bot_id` against this app's `bot_id`. Until that identity is
     /// known (`auth.test` failed or omitted it), such posts are rejected: the
     /// admission fails closed rather than risk re-entering on our own output.
+    /// That applies to every bot-authored event, including one that carries
+    /// `user` as well: `bot_user_id` is empty when `auth.test` returned no
+    /// user id, and an empty value matches nothing.
     fn inbound_sender_identity<'a>(
         message: &'a serde_json::Value,
         bot_user_id: &str,
@@ -1722,49 +1725,52 @@ impl SlackChannel {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .unwrap_or_default();
-        if !user.is_empty() {
-            if user == bot_user_id {
+        if is_bot {
+            // The opt-in admits `bot_message` posts, nothing else. Other
+            // events can carry a `bot_id` too (a bot-authored `file_share`,
+            // say) and already pass the subtype gate on their own merits;
+            // letting `bot_id` stand in for a sender there would silently
+            // widen the opt-in and make those events model-visible.
+            if !allow_bots {
                 return None;
             }
-            if is_bot && !allow_bots {
+
+            // Our own identity is checked before any sender is resolved. The
+            // echo of our own post can arrive carrying `bot_id` alone or
+            // `user` and `bot_id` together, and only `bot_id` tells it apart
+            // from a foreign app reliably: `bot_user_id` is empty when
+            // `auth.test` returned no usable user id, and an empty value
+            // matches nothing. Without a known own `bot_id` there is nothing
+            // to compare against, so nothing bot-authored is admitted.
+            let own = own_bot_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let bot_id = message
+                .get("bot_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if bot_id.is_some_and(|id| id == own) {
                 return None;
             }
-            return Some(InboundSender { id: user, is_bot });
+
+            if !user.is_empty() {
+                if user == bot_user_id {
+                    return None;
+                }
+                return Some(InboundSender { id: user, is_bot });
+            }
+
+            return Some(InboundSender {
+                id: bot_id?,
+                is_bot,
+            });
         }
 
-        if !allow_bots {
+        if user.is_empty() || user == bot_user_id {
             return None;
         }
-
-        // The opt-in admits `bot_message` posts, nothing else. Other userless
-        // events can carry a `bot_id` too (a bot-authored `file_share`, say),
-        // and those already pass the subtype gate on their own merits; letting
-        // `bot_id` stand in for a sender here would silently widen the opt-in
-        // to every userless event and make them model-visible.
-        if !is_bot {
-            return None;
-        }
-
-        let bot_id = message
-            .get("bot_id")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())?;
-        // Our own `bot_id` echo: never re-enter the agent on its own output.
-        // Without a known own identity there is no safe way to tell the echo
-        // from a foreign app, so nothing userless is admitted. A blank own id
-        // is not an identity either: it would compare unequal to our own real
-        // `bot_id` and admit the echo, so it counts as unknown here too.
-        let own = own_bot_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())?;
-        if own == bot_id {
-            return None;
-        }
-        Some(InboundSender {
-            id: bot_id,
-            is_bot: true,
-        })
+        Some(InboundSender { id: user, is_bot })
     }
 
     fn compose_incoming_content(text: String, attachment_blocks: Vec<String>) -> Option<String> {
@@ -7182,6 +7188,54 @@ mod tests {
     }
 
     #[test]
+    fn inbound_identity_drops_our_own_hybrid_bot_echo_regardless_of_user() {
+        // Our own echo can arrive as a `bot_message` carrying both `user` and
+        // `bot_id`. The `user` comparison alone does not catch it when
+        // `auth.test` returned no user id, because `bot_user_id` is then empty
+        // and matches nothing, so `bot_id` has to be checked first.
+        let own_hybrid = serde_json::json!({
+            "subtype": "bot_message",
+            "user": "U_SELF",
+            "bot_id": "B_SELF",
+            "text": "4"
+        });
+
+        for bot_user_id in ["", "U_SELF"] {
+            assert_eq!(
+                SlackChannel::inbound_sender_identity(
+                    &own_hybrid,
+                    bot_user_id,
+                    Some("B_SELF"),
+                    true
+                ),
+                None,
+                "our own hybrid echo must never resolve (bot_user_id {bot_user_id:?})"
+            );
+        }
+
+        // Unknown own identity fails closed for a hybrid event too, rather
+        // than falling back to the `user` field.
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&own_hybrid, "", None, true),
+            None,
+            "an unknown own bot id must not fall back to `user`"
+        );
+
+        // A foreign hybrid post is still admitted under its `user`.
+        let foreign_hybrid = serde_json::json!({
+            "subtype": "bot_message",
+            "user": "U_APP",
+            "bot_id": "B_APP",
+            "text": "deploy finished"
+        });
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&foreign_hybrid, "", Some("B_SELF"), true)
+                .map(|s| (s.id, s.is_bot)),
+            Some(("U_APP", true))
+        );
+    }
+
+    #[test]
     fn inbound_identity_treats_blank_own_bot_id_as_unknown() {
         // A blank own id is not an identity: compared literally it differs
         // from our real `bot_id` and would admit our own echo, so it has to
@@ -9680,6 +9734,46 @@ mod tests {
             delivered.is_empty(),
             "no userless bot post may be admitted while own bot_id is unknown, got {:?}",
             delivered.iter().map(|m| &m.sender).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_drops_our_own_hybrid_echo_when_auth_test_has_no_user_id() {
+        // `auth.test` answers with our `bot_id` but no usable `user_id`, so
+        // `bot_user_id` is empty and the own-user comparison matches nothing.
+        // Our own echo arrives as a `bot_message` carrying both fields; under
+        // wildcard peers it must still not start a turn. The foreign post in
+        // the same batch is the positive control.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "bot_message",
+                    "user": "U_SELF",
+                    "bot_id": "B_SELF",
+                    "text": "4"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "user": "U_APP",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        let senders: Vec<&str> = delivered.iter().map(|m| m.sender.as_str()).collect();
+        assert!(
+            !senders.contains(&"U_SELF"),
+            "our own hybrid echo must never reach dispatch, got {senders:?}"
+        );
+        assert_eq!(
+            senders,
+            vec!["U_APP"],
+            "only the foreign bot post should be admitted"
         );
     }
 
